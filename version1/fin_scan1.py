@@ -2,7 +2,7 @@
 import socket
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import argparse
 from tqdm import tqdm
@@ -10,85 +10,84 @@ import os
 import time
 import struct
 import random
+import sys
+
 
 def create_fin_packet(src_port: int, dst_port: int) -> bytes:
-    """Create a TCP packet with FIN flag set."""
-    # TCP header fields
+    """Create a minimal TCP header with FIN flag set."""
     seq_num = random.randint(0, 0xFFFFFFFF)
     ack_num = 0
     data_offset = 5 << 4  # 5 words (20 bytes)
-    fin_flag = 0x01       # FIN flag
+    fin_flag = 0x01       # FIN
     window = 0
     checksum = 0
     urg_ptr = 0
 
-    # Pack TCP header
-    tcp_header = struct.pack('!HHLLBBHHH', 
-                            src_port,    # source port
-                            dst_port,    # destination port
-                            seq_num,     # sequence number
-                            ack_num,     # acknowledgement number
-                            data_offset, # data offset
-                            fin_flag,    # flags (FIN)
-                            window,      # window size
-                            checksum,    # checksum
-                            urg_ptr)     # urgent pointer
+    tcp_header = struct.pack(
+        '!HHLLBBHHH',
+        src_port, dst_port,
+        seq_num, ack_num,
+        data_offset, fin_flag,
+        window, checksum, urg_ptr
+    )
     return tcp_header
 
+
+def parse_tcp_flags(response: bytes) -> int | None:
+    """Extract TCP flags from a raw IP/TCP packet."""
+    if len(response) < 40:  # minimal IPv4 + TCP header
+        return None
+    ip_header_len = (response[0] & 0x0F) * 4
+    if len(response) < ip_header_len + 20:
+        return None
+    tcp_header = response[ip_header_len:ip_header_len + 20]
+    return tcp_header[13]  # flags byte
+
+
 def fin_scan_port(host: str, port: int, timeout: float = 2.0, family: int = socket.AF_INET) -> dict:
-    """Perform FIN scan on a single port and return results."""
+    """Perform FIN scan on a single port."""
     result = {
         "host": host,
         "port": port,
-        "status": "closed",  # Default to closed (we expect RST for closed ports)
+        "status": "filtered",  # default: no response
         "service": "unknown",
         "protocol": "IPv4" if family == socket.AF_INET else "IPv6",
         "scan_type": "FIN"
     }
-    
+
     try:
-        # Create raw socket for FIN scanning
         if family == socket.AF_INET:
             s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         else:
             s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        
+
         s.settimeout(timeout)
-        
-        # Create FIN packet with random source port
+
         src_port = random.randint(1024, 65535)
         fin_packet = create_fin_packet(src_port, port)
-        
-        # Send FIN packet
+
         if family == socket.AF_INET:
             s.sendto(fin_packet, (host, port))
         else:
             s.sendto(fin_packet, (host, port, 0, 0))
-        
-        # Try to receive response
+
         try:
             response = s.recv(1024)
-            
-            if response:
-                # Check if RST flag is set in response (port is closed)
-                # RST flag is at offset 33 (0x04) in TCP header
-                if len(response) > 33 and (response[33] & 0x04):
+            flags = parse_tcp_flags(response)
+            if flags is not None:
+                if flags & 0x04:  # RST
                     result["status"] = "closed"
                 else:
-                    # Any other response means the port is open
                     result["status"] = "open"
-                    
+            else:
+                result["status"] = "filtered"
         except socket.timeout:
-            # No response - this typically means the port is OPEN
-            # (stealthy systems don't respond to FIN packets on open ports)
-            result["status"] = "open"
-            
+            # No response → could be OPEN or FILTERED
+            result["status"] = "open|filtered"
+
     except socket.error as e:
-        if e.errno == 1:  # Operation not permitted (need root)
-            result["error"] = "Root privileges required for raw socket operations"
-            result["status"] = "error"
-        elif e.errno == 13:  # Permission denied
-            result["error"] = "Permission denied for raw socket operations"
+        if getattr(e, "errno", None) in (1, 13):
+            result["error"] = "Root/admin privileges required for raw sockets"
             result["status"] = "error"
         else:
             result["error"] = f"Socket error: {str(e)}"
@@ -101,66 +100,77 @@ def fin_scan_port(host: str, port: int, timeout: float = 2.0, family: int = sock
             s.close()
         except:
             pass
-    
-    # Try to get service name for open ports
-    if result["status"] == "open":
+
+    if result["status"].startswith("open"):
         try:
             result["service"] = socket.getservbyport(port, "tcp")
         except:
             pass
-    
+
     return result
 
-def port_scanner(host: str, start_port: int, end_port: int, max_threads: int = 20, timeout: float = 2.0) -> list:
+
+def port_scanner(host: str, start_port: int, end_port: int, max_threads: int = 20,
+                 timeout: float = 2.0, delay: float = 0.02) -> list:
     """Scan a range of ports using multithreading with FIN scan."""
     results = []
     families = [socket.AF_INET]
-    
-    # Check for IPv6 support
+
     try:
         socket.getaddrinfo(host, None, socket.AF_INET6)
         families.append(socket.AF_INET6)
     except:
         pass
-    
+
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = []
         for family in families:
-            futures = [executor.submit(fin_scan_port, host, port, timeout, family) 
-                      for port in range(start_port, end_port + 1)]
-            for future in tqdm(futures, total=len(futures), desc=f"FIN Scanning ports ({family})"):
-                results.append(future.result())
-                
-                # Small delay to avoid flooding the network and being detected
-                time.sleep(0.02)
-    
+            for port in range(start_port, end_port + 1):
+                futures.append(executor.submit(fin_scan_port, host, port, timeout, family))
+                if delay > 0:
+                    time.sleep(delay)
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="FIN Scanning"):
+            results.append(future.result())
+
     return results
+
 
 def export_to_json(data: list, filename: str = "fin_scan_results.json", force: bool = False) -> None:
     """Export scan results to JSON with timestamp."""
     if os.path.exists(filename) and not force:
         raise FileExistsError(f"File {filename} already exists. Use --force to overwrite.")
-    
-    # Filter out entries with errors for the main report
-    valid_results = [r for r in data if r["status"] != "error"]
+
+    valid_results = [r for r in data if r["status"] not in ("error",)]
     error_results = [r for r in data if r["status"] == "error"]
-    
-    open_ports = [r for r in valid_results if r["status"] == "open"]
-    
+
+    open_ports = [r for r in valid_results if r["status"].startswith("open")]
+
     report = {
         "timestamp": datetime.now().isoformat(),
         "host": valid_results[0]["host"] if valid_results else "unknown",
         "scan_type": "FIN Scan",
         "total_ports_scanned": len(valid_results),
         "open_ports_count": len(open_ports),
-        "closed_ports_count": len(valid_results) - len(open_ports),
+        "closed_ports_count": len([r for r in valid_results if r["status"] == "closed"]),
+        "filtered_ports_count": len([r for r in valid_results if "filtered" in r["status"]]),
         "open_ports": [{"port": r["port"], "service": r["service"]} for r in open_ports],
         "scan_results": valid_results,
         "errors": error_results
     }
-    
+
     with open(filename, "w") as f:
         json.dump(report, f, indent=4)
     print(f"Results saved to {filename}")
+
+
+def check_privileges() -> bool:
+    """Check if program is running with privileges required for raw sockets."""
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    # Windows fallback (must run as Administrator)
+    return ctypes.windll.shell32.IsUserAnAdmin() != 0
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FIN Port Scanner - Find Open Ports Stealthily")
@@ -169,18 +179,16 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int, default=1024, help="End port (default: 1024)")
     parser.add_argument("--threads", type=int, default=20, help="Max threads (default: 20)")
     parser.add_argument("--timeout", type=float, default=2.0, help="Socket timeout in seconds (default: 2.0)")
+    parser.add_argument("--delay", type=float, default=0.02, help="Delay between sending packets (seconds)")
     parser.add_argument("--output", help="JSON output filename")
     parser.add_argument("--verbose", action="store_true", help="Show all scanned ports")
     parser.add_argument("--force", action="store_true", help="Overwrite existing output file")
     args = parser.parse_args()
 
-    # Check for root privileges (required for raw sockets)
-    if os.geteuid() != 0:
-        print("ERROR: FIN scanning requires root privileges for raw socket operations.")
-        print("Please run with sudo or as administrator.")
-        exit(1)
+    if not check_privileges():
+        print("ERROR: FIN scanning requires root/administrator privileges for raw socket operations.")
+        sys.exit(1)
 
-    # Validate inputs
     if args.start < 1 or args.end > 65535 or args.start > args.end:
         parser.error("Invalid port range. Ports must be between 1-65535 and start <= end.")
     if args.threads < 1 or args.threads > 100:
@@ -190,43 +198,46 @@ if __name__ == "__main__":
     except socket.gaierror:
         parser.error(f"Cannot resolve host {args.host}")
 
-    # Warn about stealth scanning
     print("FIN Scan - Stealth Port Detection")
-    print("   - No response: Port is OPEN (stealthy)")
+    print("   - No response: Port is OPEN or FILTERED")
     print("   - RST response: Port is CLOSED")
     print("   - Scanning large ranges may be detected")
-    
+
     if args.end - args.start + 1 > 1000:
         if input("Scan large port range? (y/n): ").lower() != 'y':
-            exit(1)
+            sys.exit(1)
 
     print(f"\nFIN Scanning {args.host} (ports {args.start}-{args.end})...")
-    results = port_scanner(args.host, args.start, args.end, args.threads, args.timeout)
-    
+    results = port_scanner(args.host, args.start, args.end, args.threads, args.timeout, args.delay)
+
     output_file = args.output or f"fin_scan_{args.host}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     export_to_json(results, output_file, args.force)
 
-    # Print summary
-    open_ports = [r for r in results if r["status"] == "open"]
+    open_ports = [r for r in results if r["status"].startswith("open")]
     closed_ports = [r for r in results if r["status"] == "closed"]
+    filtered_ports = [r for r in results if "filtered" in r["status"]]
     errors = [r for r in results if r["status"] == "error"]
-    
+
     print(f"\nFIN Scan Results:")
     print(f"Open ports: {len(open_ports)}")
     print(f"Closed ports: {len(closed_ports)}")
+    print(f"Filtered/unknown: {len(filtered_ports)}")
     print(f"Errors: {len(errors)}")
-    
+
     if open_ports:
         print(f"\nOpen ports found:")
         for port in sorted(open_ports, key=lambda x: x["port"]):
             print(f"   Port {port['port']}/tcp - {port['service']}")
-    
+
     if args.verbose:
         print(f"\nDetailed results:")
         for r in results:
-            if r["status"] == "open":
-                print(f"   Port {r['port']}: OPEN ({r['service']})")
-            elif r["status"] == "closed":
+            status = r["status"]
+            if status.startswith("open"):
+                print(f"   Port {r['port']}: {status.upper()} ({r['service']})")
+            elif status == "closed":
                 print(f"   Port {r['port']}: CLOSED")
+            elif "filtered" in status:
+                print(f"   Port {r['port']}: FILTERED/NO RESPONSE")
             else:
                 print(f"   Port {r['port']}: ERROR - {r.get('error', 'Unknown error')}")
